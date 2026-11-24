@@ -1,0 +1,762 @@
+// ============================================================================
+// Abyss · 场景 SDF
+// 世界按 CELL（水平）/ VPER（竖直）周期重复：每个格子是一座竖井。
+// 竖井局部坐标 q：竖井轴心在原点，北 = +Z，东 = +X。
+// 依赖 March.shader 里声明的动画 uniform（u_furn / u_frot / u_pist* / u_mech）。
+// ============================================================================
+
+const float CELL = 240.0;      // 竖井水平间距
+const float VPER = 300.0;      // 竖直重复周期
+const float RW = 62.0;         // 井壁半径
+const float LVL = 12.0;        // 环廊层距
+const float COR_IN = 56.5;     // 环廊内沿半径
+const float GX = -33.8;        // 连廊（通往下一座井）中心 x
+const float GHW = 15.0;        // 连廊半宽
+const float GHH = 16.0;        // 连廊半高
+const float BZ = 36.0;         // 货运桥中心 z
+const float BY = -48.0;        // 桥面顶面高度
+const vec2 TWR = vec2(-22.0, 49.0); // 升降塔轴心 xz
+const float FR = 21.0;         // 锻炉环大半径（外径约 54 m）
+const float FT = 6.0;          // 锻炉环管半径
+const float FY0 = -14.0;       // 锻炉中心基准高度（实际高度随起伏，见 u_furn.x）
+const float TRAIN_PERIOD = 480.0;
+const float CAR_LEN = 13.2;
+
+// ---- 材质 id ----
+const float M_IRON = 1.0;
+const float M_STEEL = 2.0;
+const float M_CHROME = 3.0;
+const float M_PAINT = 4.0;
+const float M_CABLE = 5.0;
+const float M_FURN = 6.0;
+const float M_EMBER = 7.0;
+const float M_CYAN = 8.0;
+const float M_LAMP = 9.0;
+const float M_FLOOR = 10.0;
+const float M_CLOTH = 11.0;
+const float M_HELMET = 12.0;
+const float M_CARGO = 13.0;
+const float M_INGOT = 14.0;
+const float M_GLASS = 15.0;
+const float M_DEEP = 16.0;
+const float M_RAIL = 17.0;
+const float M_SCREEN = 18.0;
+const float M_HAZARD = 19.0;
+const float M_STRUCT = 20.0;
+const float M_PORTAL = 21.0;   // 连廊洞口框灯（柔和琥珀色）   // 涂装结构钢（梁、桁架、环廊）
+
+vec3 cellLocal(vec3 p) {
+    vec3 q = p;
+    q.xz = q.xz - CELL * round(q.xz / CELL);
+    q.y = q.y - VPER * round(q.y / VPER);
+    return q;
+}
+
+vec2 opU2(vec2 a, vec2 b) {
+    return (b.x < a.x) ? b : a;
+}
+
+// ---------------------------------------------------------------------------
+// 连廊（倾斜隧道）：从本井北壁 y=24 通到下一座井南壁 y=0
+// ---------------------------------------------------------------------------
+float galleryZZ(float z) {
+    return (z > 0.0) ? z : (z + CELL);
+}
+
+float galleryFloor(float zz) {
+    return 24.0 - 24.0 * clamp((zz - 62.0) / 116.0, 0.0, 1.0);
+}
+
+// 连廊空腔：内部为负（只倒上方两个角）
+float galleryHollow(vec3 q) {
+    float zz = galleryZZ(q.z);
+    vec2 c = vec2(q.x - GX, q.y - galleryFloor(zz) - GHH);
+    float d = sdBox2(c, vec2(GHW, GHH));
+    return max(d, (abs(c.x) + c.y - (GHW + GHH - 5.0)) * 0.70710678);
+}
+
+// ---------------------------------------------------------------------------
+// 井壁：圆柱展开坐标里的 Menger 海绵（KIFS 盒子折叠）+ 装甲肋板 + 竖管
+// ---------------------------------------------------------------------------
+float mengerField(vec3 c, float lod) {
+    // c 以米为单位，单元 36 m（归一化后 [-1,1]）
+    vec3 p = c / 18.0;
+    float d = -1e5;
+    float s = 1.0;
+    for (int m = 0; m < 3; m++) {
+        if (m == 2 && lod > 0.3) {
+            break;
+        }
+        vec3 ps = p * s;
+        vec3 a = mod(ps, 2.0) - 1.0;
+        // Menger 变体：第 2、3 级孔洞按单元随机保留，打破规则网格
+        float keep = 1.0;
+        if (m > 0) {
+            float hk = hash13(floor(ps * 0.5) + vec3(float(m) * 13.1, 7.0, 3.0));
+            keep = step((m == 1) ? 0.38 : 0.55, hk);
+        }
+        s *= 3.0;
+        vec3 r = abs(1.0 - 3.0 * abs(a));
+        float da = max(r.x, r.y);
+        float db = max(r.y, r.z);
+        float dc = max(r.z, r.x);
+        float cc = (min(da, min(db, dc)) - 1.0) / s;
+        d = max(d, (keep > 0.5) ? cc : (-1e5));
+    }
+    return d * 18.0;
+}
+
+vec2 wallSDF(vec3 q, float r, float lod) {
+    float w = r - RW;                       // >0：进入井壁实体
+    if (w < -3.2) {
+        return vec2(-w - 2.0, M_IRON);      // 远离井壁：下界（管线最多凸出约 1.6 m）
+    }
+    float ang = atan(q.x, q.z);
+    float u = ang * 63.0254;                // 一圈 11 个 36 m 单元
+    float holes = mengerField(vec3(u, q.y - 6.0, w - 18.0), lod);
+    float mass = max(-w, min(holes, 54.0 - w));
+    // 孔洞随机变体会让场在单元边界不连续：靠近 / 进入井壁时限制步长
+    mass = min(mass, 1.6 + max(-w, 0.0));
+    float gh = galleryHollow(q);
+    float tt = sdBox2(vec2(q.z - BZ, q.y - BY - 4.5), vec2(6.2, 5.6));
+    float carve = min(gh, tt);
+    mass = max(mass, -carve);
+    vec2 res = vec2(mass, (w > 5.0) ? M_DEEP : M_IRON);
+
+    // 装甲肋板（单元边界处，跨越孔洞之间的实体）
+    float us = rep(u - 18.0, 36.0);
+    float rib = sdChamferBox2(vec2(us, w + 0.55), vec2(0.34, 0.6), 0.12);
+    // 肋板上每 3 m 一道横向加强筋
+    float yr3 = rep(q.y - 1.5, 3.0);
+    float stiff = sdChamferBox2(vec2(yr3, w + 0.75), vec2(0.07, 0.42), 0.03);
+    stiff = max(stiff, abs(us) - 0.9);
+    rib = min(rib, stiff);
+    rib = max(rib, -carve);
+    res = opU(res, rib, M_STEEL);
+
+    // 竖管：肋板两侧各一根粗管 + 一根细管
+    vec2 pp = vec2(abs(us) - 3.1, w + 1.05);
+    float pipe = length(pp) - 0.44;
+    vec2 pp2 = vec2(abs(us) - 4.25, w + 0.6);
+    pipe = min(pipe, length(pp2) - 0.2);
+    if (lod < 0.12) {
+        // 法兰：每 4 m 一圈，带螺栓（近处）
+        float yr = rep(q.y - 2.0, 4.0);
+        float fl = max(length(pp) - 0.58, abs(yr) - 0.075);
+        if (lod < 0.02) {
+            float ba = atan(pp.y, pp.x);
+            float bs = rep(ba, TAU / 10.0) * 0.52;
+            float bolt = max(length(vec2(bs, length(pp) - 0.52)) - 0.03, abs(yr) - 0.11);
+            fl = min(fl, bolt);
+        }
+        pipe = min(pipe, fl);
+        // 管卡：在每层环廊下方把管子固定到墙上
+        float yl = rep(q.y + 2.2, LVL);
+        float clamp1 = max(sdBox2(vec2(abs(us) - 3.1, w + 0.55), vec2(0.12, 0.55)), abs(yl) - 0.14);
+        pipe = min(pipe, clamp1);
+    }
+    pipe = max(pipe, -carve);
+    res = opU(res, pipe, M_STEEL);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 环廊：每 12 m 一层，内沿护栏、檐梁上的青色能量槽、托架、檐下灯
+// ---------------------------------------------------------------------------
+vec2 corridorSDF(vec3 q, float r, float lod) {
+    if (r < COR_IN - 1.0) {
+        return vec2(COR_IN - 0.3 - r, M_STEEL);
+    }
+    float lv = round(q.y / LVL);
+    float yl = q.y - LVL * lv;             // 本层甲板顶面为 0
+    float levelY = LVL * lv;
+    // 连廊口与列车隧道口处截断
+    bool southMouth = abs(q.x - GX) < GHW + 0.4 && q.z < 0.0;
+    bool northMouth = abs(q.x - GX) < GHW + 0.4 && q.z > 0.0;
+    bool cutAll = (southMouth && levelY > 1.0 && levelY < 33.0) || (northMouth && levelY > 25.0 && levelY < 57.0);
+    bool cutRail = (southMouth && abs(levelY) < 1.0) || (northMouth && abs(levelY - 24.0) < 1.0);
+    bool portal = abs(q.z - BZ) < 6.6 && abs(q.x) > 40.0 && levelY > BY - 2.0 && levelY < BY + 13.0;
+    if (cutAll || portal) {
+        return vec2(1.5, M_STEEL);
+    }
+    vec2 res = vec2(1e5, M_STEEL);
+    float deck = sdBox2(vec2(r - 59.6, yl + 0.22), vec2(3.1, 0.22));
+    float fascia = sdBox2(vec2(r - (COR_IN + 0.17), yl + 0.62), vec2(0.17, 0.62));
+    res = opU(res, min(deck, fascia), M_STRUCT);
+    // 能量槽：檐梁正面的发光条
+    float slot = sdBox2(vec2(r - (COR_IN - 0.015), yl + 0.66), vec2(0.03, 0.1));
+    res = opU(res, slot, M_CYAN);
+    float ang = atan(q.x, q.z);
+    // 托架：每 7.5° 一块斜撑
+    float as = rep(ang, TAU / 48.0) * r;
+    float kb = max(sdSeg2(vec2(r, yl), vec2(62.0, -3.8), vec2(57.0, -0.6)) - 0.17, abs(as) - 0.09);
+    res = opU(res, kb, M_STRUCT);
+    // 檐下灯：每 15°
+    float la = rep(ang + TAU / 48.0, TAU / 24.0) * r;
+    float lamp = sdBox3(vec3(la, yl + 0.5, r - 57.4), vec3(0.32, 0.06, 0.16));
+    res = opU(res, lamp, M_LAMP);
+    if (!cutRail && yl > -0.2) {
+        float pr = r - 56.72;
+        float post = max(sdBox2(vec2(rep(ang, TAU / 180.0) * r, pr), vec2(0.028, 0.028)), abs(yl - 0.55) - 0.55);
+        float rails = min(length(vec2(pr, yl - 1.1)) - aaRadius(0.026, lod), length(vec2(pr, yl - 0.55)) - aaRadius(0.018, lod));
+        res = opU(res, post, M_PAINT);
+        res = opU(res, rails, M_RAIL);
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 工人（尺度参照）：脚在原点、面朝 +z；pose 0 扶栏俯视，1 拿平板站立
+// ---------------------------------------------------------------------------
+vec2 workerSDF(vec3 p, float pose) {
+    float bound = sdBox3(p - vec3(0.0, 0.95, 0.15), vec3(0.42, 0.98, 0.55));
+    if (bound > 0.25) {
+        return vec2(bound, M_CLOTH);
+    }
+    float lean = (pose < 0.5) ? 0.24 : 0.05;
+    vec3 ftL = vec3(-0.14, 0.09, (pose < 0.5) ? (-0.14) : 0.02);
+    vec3 ftR = vec3(0.14, 0.09, 0.09);
+    float legs = min(sdCapsule(p, vec3(-0.1, 0.9, 0.0), ftL, 0.075), sdCapsule(p, vec3(0.1, 0.9, 0.0), ftR, 0.075));
+    float boots = min(sdRoundBox3(p - ftL - vec3(0.0, -0.035, 0.05), vec3(0.06, 0.055, 0.13), 0.025),
+                      sdRoundBox3(p - ftR - vec3(0.0, -0.035, 0.05), vec3(0.06, 0.055, 0.13), 0.025));
+    float pelvis = sdRoundBox3(p - vec3(0.0, 0.93, 0.0), vec3(0.17, 0.1, 0.1), 0.07);
+    vec3 tp = p - vec3(0.0, 0.93, 0.0);
+    tp.yz = rot2(tp.yz, lean);
+    float torso = sdRoundBox3(tp - vec3(0.0, 0.32, 0.0), vec3(0.2, 0.28, 0.12), 0.09);
+    vec3 shL = vec3(-0.22, 0.53, 0.0);
+    vec3 shR = vec3(0.22, 0.53, 0.0);
+    vec3 elL = vec3(-0.27, 0.28, 0.2);
+    vec3 elR = vec3(0.27, 0.28, 0.2);
+    vec3 haL = vec3(-0.19, 0.2, 0.46);
+    vec3 haR = vec3(0.19, 0.2, 0.46);
+    if (pose > 0.5) {
+        elL = vec3(-0.25, 0.28, 0.12);
+        elR = vec3(0.25, 0.28, 0.12);
+        haL = vec3(-0.11, 0.36, 0.33);
+        haR = vec3(0.11, 0.36, 0.33);
+    }
+    float arms = min(min(sdCapsule(tp, shL, elL, 0.062), sdCapsule(tp, elL, haL, 0.05)),
+                     min(sdCapsule(tp, shR, elR, 0.062), sdCapsule(tp, elR, haR, 0.05)));
+    float body = smin(smin(torso, pelvis, 0.08), legs, 0.05);
+    body = smin(body, arms, 0.04);
+    vec2 res = vec2(body, M_CLOTH);
+    res = opU(res, boots, M_IRON);
+    float head = length(tp - vec3(0.0, 0.71, 0.02)) - 0.1;
+    res = opU(res, head, M_CLOTH);
+    float helmet = max(length(tp - vec3(0.0, 0.73, 0.02)) - 0.128, -(tp.y - 0.725));
+    helmet = min(helmet, sdCylY(tp - vec3(0.0, 0.728, 0.05), 0.155, 0.009));
+    res = opU(res, helmet, M_HELMET);
+    float lampH = sdCylZ(tp - vec3(0.0, 0.79, 0.14), 0.026, 0.022);
+    res = opU(res, lampH, M_LAMP);
+    if (pose > 0.5) {
+        vec3 tb = tp - vec3(0.0, 0.4, 0.36);
+        tb.yz = rot2(tb.yz, -0.7);
+        float tablet = sdRoundBox3(tb, vec3(0.13, 0.09, 0.008), 0.006);
+        res = opU(res, tablet, M_SCREEN);
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 平台（连廊口的落脚平台）：南口检修平台 y=0（zs=-1），北口上层平台 y=24（zs=+1）
+// ---------------------------------------------------------------------------
+vec2 platformSDF(vec3 q, float lod, float yFloor, float zs, float isSouth) {
+    vec3 lp = vec3(q.x - GX, q.y - yFloor, zs * q.z);   // lp.z：38.25 内沿 → 62 井壁
+    float bound = max(max(abs(lp.x) - 15.6, 37.4 - lp.z), max(lp.y - 6.0, -lp.y - 7.8));
+    if (bound > 0.8) {
+        return vec2(bound, M_FLOOR);
+    }
+    vec2 res = vec2(1e5, M_FLOOR);
+    float fl = sdBox3(lp - vec3(0.0, -0.22, 50.2), vec3(15.0, 0.22, 11.95));
+    if (isSouth < 0.5) {
+        // 上层平台：升降塔穿过的井口
+        vec2 th = vec2(q.x - TWR.x, q.z - TWR.y);
+        fl = max(fl, -sdBox2(th, vec2(3.55, 3.55)));
+    }
+    res = opU(res, fl, M_FLOOR);
+    // 内沿槽钢包边 + 黄色警示踢脚
+    float trim = sdBox3(lp - vec3(0.0, -0.42, 38.33), vec3(15.0, 0.42, 0.1));
+    res = opU(res, trim, M_STRUCT);
+    float toe = sdBox3(lp - vec3(0.0, 0.075, 38.28), vec3(15.0, 0.075, max(0.007, 0.4 * lod)));
+    res = opU(res, toe, M_HAZARD);
+    // 护栏（内沿 + 两侧）
+    float rx = rep(lp.x, 1.5);
+    float postI = max(sdBox3(vec3(rx, lp.y - 0.55, lp.z - 38.3), vec3(0.03, 0.55, 0.03)), abs(lp.x) - 15.05);
+    float sx = abs(lp.x) - 14.97;
+    float rz = rep(lp.z - 38.3, 1.5);
+    float postS = max(sdBox3(vec3(sx, lp.y - 0.55, rz), vec3(0.03, 0.55, 0.03)), max(38.2 - lp.z, lp.z - 61.5));
+    res = opU(res, min(postI, postS), M_PAINT);
+    float rTop = aaRadius(0.027, lod);
+    float rMid = aaRadius(0.019, lod);
+    float railI = min(sdCylX(vec3(lp.x, lp.y - 1.1, lp.z - 38.3), rTop, 15.0),
+                      sdCylX(vec3(lp.x, lp.y - 0.56, lp.z - 38.3), rMid, 15.0));
+    float railS = min(sdCylZ(vec3(sx, lp.y - 1.1, lp.z - 49.9), rTop, 11.6),
+                      sdCylZ(vec3(sx, lp.y - 0.56, lp.z - 49.9), rMid, 11.6));
+    res = opU(res, min(railI, railS), M_RAIL);
+    // 悬臂工字钢 + 斜撑
+    float bx = rep(lp.x, 3.0);
+    float ib = max(sdIBeam2(vec2(bx, lp.y + 0.9), 0.46, 0.17, 0.04, 0.014), abs(lp.z - 50.2) - 11.8);
+    ib = max(ib, abs(lp.x) - 15.0);
+    res = opU(res, ib, M_STRUCT);
+    float sx6 = rep(lp.x - 1.5, 6.0);
+    float strut = max(sdSeg2(vec2(lp.z, lp.y), vec2(61.0, -7.2), vec2(40.0, -1.3)) - 0.19, abs(sx6) - 0.16);
+    strut = max(strut, abs(lp.x) - 15.0);
+    res = opU(res, strut, M_STRUCT);
+
+    if (isSouth > 0.5) {
+        // 控制台 + 屏幕
+        vec3 cp = lp - vec3(6.2, 0.0, 44.2);
+        float con = sdChamferBox(cp - vec3(0.0, 0.52, 0.0), vec3(0.62, 0.52, 0.32), 0.04);
+        con = max(con, dot(cp - vec3(0.0, 1.0, -0.1), vec3(0.0, 0.78, -0.62)));
+        res = opU(res, con, M_STEEL);
+        vec3 sp = cp - vec3(0.0, 0.88, -0.16);
+        sp.yz = rot2(sp.yz, 0.67);
+        res = opU(res, sdBox3(sp, vec3(0.45, 0.16, 0.012)), M_SCREEN);
+        // 泛光灯杆
+        vec3 mp = lp - vec3(-12.6, 0.0, 40.2);
+        float mast = sdCylY(mp - vec3(0.0, 2.55, 0.0), 0.075, 2.55);
+        mast = min(mast, sdCylY(mp - vec3(0.0, 0.08, 0.0), 0.22, 0.08));
+        res = opU(res, mast, M_PAINT);
+        vec3 hp = mp - vec3(0.0, 5.1, 0.0);
+        hp.yz = rot2(hp.yz, 0.55);
+        float head = sdChamferBox(hp, vec3(0.38, 0.22, 0.2), 0.05);
+        res = opU(res, head, M_STEEL);
+        res = opU(res, sdBox3(hp - vec3(0.0, 0.0, -0.205), vec3(0.32, 0.17, 0.01)), M_LAMP);
+        // 沿东侧护栏的管线：法兰、支架、阀门手轮
+        vec3 pr = lp - vec3(14.25, 0.42, 50.0);
+        float pipeRun = sdCylZ(pr, 0.15, 11.6);
+        float fz = rep(pr.z, 2.0);
+        float flg = max(length(pr.xy) - 0.23, abs(fz) - 0.035);
+        if (lod < 0.015) {
+            float ba = atan(pr.y, pr.x);
+            float bs = rep(ba, TAU / 8.0) * 0.195;
+            float bolt = max(length(vec2(bs, length(pr.xy) - 0.195)) - 0.016, abs(fz) - 0.065);
+            flg = min(flg, bolt);
+        }
+        flg = max(flg, abs(pr.z) - 11.6);
+        float sup = max(sdBox3(vec3(pr.x, pr.y + 0.22, rep(pr.z - 1.0, 2.0)), vec3(0.05, 0.22, 0.05)), abs(pr.z) - 11.0);
+        vec3 vp = pr - vec3(0.0, 0.4, -4.0);
+        float wheel = sdTorus(vp, 0.2, 0.022);
+        float stem = sdCylY(vp + vec3(0.0, 0.2, 0.0), 0.03, 0.2);
+        res = opU(res, min(min(pipeRun, flg), sup), M_STEEL);
+        res = opU(res, min(wheel, stem), M_HAZARD);
+        // 气瓶
+        vec3 gp = lp - vec3(-10.0, 0.0, 55.5);
+        gp.x = abs(gp.x + 0.2) - 0.2;
+        float gas = sdCylY(gp - vec3(0.0, 0.72, 0.0), 0.16, 0.62) - 0.04;
+        res = opU(res, gas, M_CARGO);
+        // 工人
+        res = opU2(res, workerSDF(vec3(lp.x + 4.0, lp.y, 38.86 - lp.z), 0.0));
+        vec3 wp = vec3(lp.x - 3.1, lp.y, 40.7 - lp.z);
+        wp.xz = rot2(wp.xz, -0.95);
+        res = opU2(res, workerSDF(wp, 1.0));
+    } else {
+        // 上层平台：绞车滚筒 + 一名工人
+        vec3 dp = lp - vec3(-7.0, 1.3, 50.0);
+        float drum = sdCylX(dp, 1.2, 1.6);
+        drum = min(drum, sdCylX(dp, 1.45, 0.08) - 0.0);
+        drum = min(drum, sdCylX(vec3(abs(dp.x) - 1.75, dp.y, dp.z), 1.45, 0.08));
+        res = opU(res, drum, M_IRON);
+        float frameD = sdBox3(vec3(abs(dp.x) - 1.9, dp.y + 0.65, dp.z), vec3(0.12, 0.65, 0.8));
+        res = opU(res, frameD, M_HAZARD);
+        vec3 wq = vec3(lp.x + 1.5, lp.y, 39.0 - lp.z);
+        res = opU2(res, workerSDF(wq, 0.0));
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 连廊内部：门式肋框、KIFS 顶棚桁架、轨道、侧壁管线、顶部能量槽、吊灯
+// ---------------------------------------------------------------------------
+vec2 galleryDetailSDF(vec3 q, float lod) {
+    float gx = q.x - GX;
+    float zz = galleryZZ(q.z);
+    float bz = max(58.0 - zz, zz - 182.0);
+    float bound = max(abs(gx) - GHW - 0.2, bz);
+    if (bound > 1.0) {
+        return vec2(bound, M_STEEL);
+    }
+    float yf = galleryFloor(zz);
+    float gy = q.y - yf;
+    vec2 res = vec2(1e5, M_STEEL);
+    // 空腔截面（内部为负）
+    float hollow = max(sdBox2(vec2(gx, gy - GHH), vec2(GHW, GHH)), (abs(gx) + gy - GHH - (GHW + GHH - 5.0)) * 0.70710678);
+    // 门式肋框，每 12 m
+    float zr = rep(zz - 4.0, 12.0);
+    float frame = max(abs(hollow + 0.6) - 0.6, abs(zr) - 0.55);
+    frame = max(frame, -gy + 0.0);
+    res = opU(res, frame, M_STRUCT);
+    // 顶棚 KIFS 桁架层：Menger 折叠（2 次）
+    float slab = abs(gy - 26.5) - 2.6;
+    if (slab < 2.0) {
+        vec3 kp = vec3(zz - 2.0, gy - 26.5, gx) / 3.0;
+        float k = -1e5;
+        float s = 1.0;
+        for (int m = 0; m < 2; m++) {
+            vec3 a = mod(kp * s, 2.0) - 1.0;
+            s *= 3.0;
+            vec3 rr = abs(1.0 - 3.0 * abs(a));
+            k = max(k, (min(max(rr.x, rr.y), min(max(rr.y, rr.z), max(rr.z, rr.x))) - 1.0) / s);
+        }
+        float lattice = max(max(slab, k * 3.0), hollow + 1.2);
+        lattice = max(lattice, -(abs(gx) - 0.0) + 0.0);
+        res = opU(res, max(lattice, abs(gx) - GHW + 1.2), M_IRON);
+    }
+    // 轨道（两条，沿坡度）
+    float rail = sdBox2(vec2(abs(abs(gx) - 4.0) - 0.72, gy - 0.09), vec2(0.04, 0.09));
+    res = opU(res, rail, M_STEEL);
+    // 侧壁管线
+    vec2 pw = vec2(abs(gx) - (GHW - 0.75), gy - 3.2);
+    float pipes = min(length(pw) - 0.42, length(pw - vec2(0.15, 1.15)) - 0.26);
+    res = opU(res, pipes, M_STEEL);
+    // 顶部斜面上的能量槽（引向下一座井的透视线）
+    float cs = sdBox2(vec2(abs(gx) - (GHW - 2.4), gy - (2.0 * GHH - 2.6)), vec2(0.16, 0.16));
+    res = opU(res, cs, M_CYAN);
+    // 两端洞口的琥珀色框灯（从隧道里望去，框住下一座井腔）
+    float mouthZ = min(abs(zz - 64.0), abs(zz - 176.0));
+    float portalRing = max(abs(hollow + 1.45) - 0.07, mouthZ - 0.2);
+    portalRing = max(portalRing, -gy + 0.3);
+    res = opU(res, portalRing, M_PORTAL);
+    // 吊灯
+    float lz = rep(zz - 10.0, 12.0);
+    float lampG = sdBox3(vec3(abs(gx) - 6.0, gy - 22.6, lz), vec3(0.4, 0.08, 0.25));
+    res = opU(res, lampG, M_LAMP);
+    float hang = max(length(vec2(abs(gx) - 6.0, lz)) - aaRadius(0.02, lod), max(22.6 - gy, gy - 24.0));
+    res = opU(res, hang, M_CABLE);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 环形锻炉：装甲肋板、外缘法兰、内侧炉口槽、旋转叶片、熔芯、炉底
+// ---------------------------------------------------------------------------
+vec3 furnaceFrame(vec3 q) {
+    vec3 fp = q - vec3(0.0, u_furn.x, 0.0);
+    fp.yz = vec2(u_frot.x * fp.y + u_frot.y * fp.z, -u_frot.y * fp.y + u_frot.x * fp.z);
+    fp.xy = vec2(u_frot.z * fp.x + u_frot.w * fp.y, -u_frot.w * fp.x + u_frot.z * fp.y);
+    return fp;
+}
+
+vec2 furnaceSDF(vec3 q, float lod) {
+    vec3 fp = furnaceFrame(q);
+    float rho = length(fp.xz);
+    float bound = max(rho - 28.6, abs(fp.y + 1.0) - 8.6);
+    if (bound > 1.5) {
+        return vec2(bound, M_FURN);
+    }
+    vec2 cs = vec2(rho - FR, fp.y);
+    float lc = length(cs);
+    float tube = lc - FT;
+    float phi = atan(fp.x, fp.z);
+    // 炉口：内赤道一圈凹槽
+    float groove = sdBox2(vec2(cs.x + FT, cs.y), vec2(1.5, 0.75));
+    float body = max(tube, -groove);
+    // 装甲板：管体外再包一层 0.28 m 厚的分块装甲，沿大圆 32 块、沿管截面 8 块，板缝 0.2 m
+    float beta = atan(cs.y, cs.x);
+    float tang = rep(phi, TAU / 32.0) * max(rho, 1.0);
+    float btan = rep(beta + TAU / 16.0, TAU / 8.0) * FT;
+    float armor = max(lc - FT - 0.28, FT - 0.05 - lc);
+    armor = max(armor, 0.1 - abs(tang));
+    armor = max(armor, 0.1 - abs(btan));
+    armor = max(armor, -groove);
+    // 8 道结构箍（带倒角）
+    float hoopPhi = rep(phi + TAU / 64.0, TAU / 8.0) * max(rho, 1.0);
+    float rib = sdChamferBox2(vec2(lc - FT - 0.36, hoopPhi), vec2(0.5, 0.42), 0.14);
+    rib = max(rib, -groove);
+    rib = min(rib, armor);
+    // 外赤道法兰带
+    float band = max(abs(lc - FT - 0.14) - 0.16, abs(cs.y) - 0.75);
+    band = max(band, -cs.x);
+    vec2 res = vec2(body, M_FURN);
+    res = opU(res, min(rib, band), M_STEEL);
+    // 外赤道警示灯（8 盏）
+    float lphi = rep(phi + TAU / 16.0, TAU / 8.0) * max(rho, 1.0);
+    float warn = sdBox3(vec3(lphi, cs.y, cs.x - FT - 0.34), vec3(0.28, 0.13, 0.1));
+    res = opU(res, warn, M_LAMP);
+    // 炉口槽底：发光
+    float glowWall = sdBox2(vec2(cs.x + FT - 1.35, cs.y), vec2(0.2, 0.75));
+    res = opU(res, max(glowWall, tube - 0.0), M_EMBER);
+    if (lod < 0.03) {
+        // 焊缝：肋板之间的半圆焊道
+        float wphi = tang;
+        float weld = length(vec2(wphi, lc - FT - 0.05)) - 0.05;
+        weld = max(weld, -groove);
+        res = opU(res, weld, M_STEEL);
+    }
+    // 叶片 + 轮毂（环孔内，按 u_furn.y 旋转）
+    if (rho < FR - FT + 1.0) {
+        float ang = phi - u_furn.y;
+        float ab = rep(ang, TAU / 16.0);
+        float twist = 0.32 + 0.4 * (1.0 - rho / 15.0);
+        vec2 bp = vec2(ab * rho, fp.y - 0.6);
+        bp = rot2(bp, twist);
+        float blade = max(sdChamferBox2(bp, vec2(1.9, 0.16), 0.06), abs(rho - 9.3) - 5.8);
+        res = opU(res, blade, M_STEEL);
+        float hub = sdCylY(fp - vec3(0.0, 0.6, 0.0), 3.4, 3.0);
+        hub = min(hub, sdCylY(fp - vec3(0.0, 3.8, 0.0), 2.2, 0.4));
+        res = opU(res, hub, M_IRON);
+        float hubRing = max(abs(rho - 3.45) - 0.06, abs(fp.y - 1.5) - 0.12);
+        res = opU(res, hubRing, M_EMBER);
+        // 熔芯（发光盘）与炉底碟
+        float core = sdCylY(fp + vec3(0.0, 2.5, 0.0), 15.2, 0.3);
+        res = opU(res, core, M_EMBER);
+        float dish = sdCylY(fp + vec3(0.0, 4.4, 0.0), 15.4, 1.5);
+        res = opU(res, dish, M_IRON);
+    }
+    return res;
+}
+
+// 液压活塞：缸体固定，抛光活塞杆接到锻炉顶（随锻炉起伏、倾斜而伸缩）+ 上方吊杆
+vec2 pistonSDF(vec3 q, float lod) {
+    vec3 a = vec3(abs(q.x), q.y, abs(q.z));
+    vec2 d2 = a.xz - vec2(14.85, 14.85);
+    float bound = max(length(d2) - 2.4, max(FY0 + 3.5 - q.y, q.y - 80.0));
+    if (bound > 1.0) {
+        return vec2(bound, M_STEEL);
+    }
+    vec2 res = vec2(1e5, M_STEEL);
+    float yb = q.y - FY0;                       // 相对锻炉基准高度
+    float barrel = sdCylY(vec3(d2.x, yb - 14.5, d2.y), 1.25, 3.5);
+    barrel = min(barrel, sdCylY(vec3(d2.x, yb - 18.0, d2.y), 1.55, 0.35));
+    barrel = min(barrel, sdCylY(vec3(d2.x, yb - 11.1, d2.y), 1.45, 0.25));
+    if (lod < 0.05) {
+        // 缸体加强环
+        float ringB = max(length(d2) - 1.34, abs(rep(yb - 12.5, 2.2)) - 0.08);
+        ringB = max(ringB, abs(yb - 14.5) - 3.3);
+        barrel = min(barrel, ringB);
+    }
+    res = opU(res, barrel, M_STEEL);
+    float hTop = 70.2;
+    float hBot = FY0 + 18.0;
+    float hanger = sdCylY(vec3(d2.x, q.y - 0.5 * (hTop + hBot), d2.y), 0.45, 0.5 * (hTop - hBot));
+    if (lod < 0.1) {
+        float clampH = max(length(d2) - 0.62, abs(rep(q.y - 2.0, 6.0)) - 0.16);
+        clampH = max(clampH, max(hBot - q.y, q.y - hTop));
+        hanger = min(hanger, clampH);
+    }
+    res = opU(res, hanger, M_STEEL);
+    // 四根活塞杆（下端来自 uniform）
+    float topY = FY0 + 11.0;
+    vec3 top0 = vec3(u_pist0.x, topY, u_pist0.z);
+    vec3 top1 = vec3(u_pist1.x, topY, u_pist1.z);
+    vec3 top2 = vec3(u_pist2.x, topY, u_pist2.z);
+    vec3 top3 = vec3(u_pist3.x, topY, u_pist3.z);
+    float rod = min(min(sdCapsule(q, top0, u_pist0.xyz, 0.62), sdCapsule(q, top1, u_pist1.xyz, 0.62)),
+                    min(sdCapsule(q, top2, u_pist2.xyz, 0.62), sdCapsule(q, top3, u_pist3.xyz, 0.62)));
+    res = opU(res, rod, M_CHROME);
+    // 杆端球铰座
+    float clevis = min(min(length(q - u_pist0.xyz) - 0.95, length(q - u_pist1.xyz) - 0.95),
+                       min(length(q - u_pist2.xyz) - 0.95, length(q - u_pist3.xyz) - 0.95));
+    res = opU(res, clevis, M_IRON);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 货运桥：桁架侧梁、桥面、横梁与下平联、轨道、导航灯、能量槽
+// ---------------------------------------------------------------------------
+vec2 trainSDF(vec3 b, float worldX, float headX, float dir, float trackZ, float nCars, float lod) {
+    float s = mod(dir * (headX - worldX), TRAIN_PERIOD);
+    float trainLen = nCars * CAR_LEN;
+    float zb = b.z - trackZ;
+    float bound = max(max(abs(zb) - 1.75, abs(b.y - 2.2) - 2.1), max(-s - 0.5, s - trainLen - 0.5));
+    // s 在周期上折返时，靠近 TRAIN_PERIOD 的一端也算车头前方
+    float sWrap = TRAIN_PERIOD - s;
+    bound = min(bound, max(max(abs(zb) - 1.75, abs(b.y - 2.2) - 2.1), sWrap - 0.5));
+    if (bound > 1.0) {
+        return vec2(bound, M_CARGO);
+    }
+    float idx = clamp(floor(s / CAR_LEN), 0.0, nCars - 1.0);
+    float cx = s - CAR_LEN * (idx + 0.5);
+    vec3 cp = vec3(cx, b.y - 2.2, zb);
+    vec2 res = vec2(1e5, M_CARGO);
+    float car = sdChamferBox(cp, vec3(6.15, 1.7, 1.6), 0.1);
+    float frameC = sdBox3(cp + vec3(0.0, 1.55, 0.0), vec3(6.3, 0.25, 1.35));
+    float coupler = sdBox3(vec3(abs(cx) - 6.45, b.y - 1.0, zb), vec3(0.35, 0.12, 0.12));
+    bool isIngot = mod(idx, 2.0) > 0.5 && idx > 0.5;
+    if (idx < 0.5) {
+        // 车头：斜切前脸 + 头灯
+        car = max(car, dot(cp - vec3(-6.15, 1.0, 0.0) * dir, normalize(vec3(-0.6 * dir, 1.0, 0.0))));
+        float lightF = sdBox3(vec3(cx + 6.12 * dir, b.y - 1.6, abs(zb) - 1.05), vec3(0.06, 0.16, 0.22));
+        res = opU(res, lightF, M_LAMP);
+        res = opU(res, min(car, frameC), M_HAZARD);
+    } else if (isIngot) {
+        // 敞车：车厢开口里装着发光钢锭
+        float hollowC = sdBox3(cp - vec3(0.0, 0.8, 0.0), vec3(5.95, 1.2, 1.42));
+        car = max(car, -hollowC);
+        res = opU(res, min(car, frameC), M_CARGO);
+        vec3 ip = vec3(rep(cx, 1.9), b.y - 2.6, zb);
+        float ingot = max(sdChamferBox(ip, vec3(0.75, 0.42, 1.15), 0.08), abs(cx) - 5.7);
+        res = opU(res, ingot, M_INGOT);
+    } else {
+        // 集装箱：瓦楞
+        if (lod < 0.05) {
+            float corr = sdBox3(vec3(rep(cx, 0.55), cp.y, zb), vec3(0.06, 1.55, 1.64));
+            corr = max(corr, abs(cx) - 5.9);
+            car = min(car, corr);
+        }
+        res = opU(res, min(car, frameC), M_CARGO);
+    }
+    res = opU(res, coupler, M_IRON);
+    return res;
+}
+
+vec2 bridgeSDF(vec3 p, vec3 q, float lod) {
+    vec3 b = q - vec3(0.0, BY, BZ);          // b.y=0 桥面顶，b.z=0 桥中心
+    float bound = max(abs(b.z) - 6.2, max(b.y - 8.0, -b.y - 4.2));
+    if (bound > 1.2) {
+        return vec2(bound, M_STEEL);
+    }
+    vec2 res = vec2(1e5, M_STEEL);
+    float deck = sdBox2(vec2(b.y + 0.4, b.z), vec2(0.4, 5.05));
+    res = opU(res, deck, M_FLOOR);
+    // 两侧华伦桁架
+    vec2 yz = vec2(b.y, abs(b.z) - 4.65);
+    float chordB = sdChamferBox2(yz - vec2(0.35, 0.0), vec2(0.38, 0.32), 0.06);
+    float chordT = sdChamferBox2(yz - vec2(7.0, 0.0), vec2(0.32, 0.32), 0.06);
+    float xm = abs(rep(b.x, 12.0));
+    float diag = length(vec2(sdSeg2(vec2(xm, b.y), vec2(0.0, 0.6), vec2(6.0, 6.8)), 0.0)) - 0.2;
+    diag = max(diag, abs(yz.y) - 0.2);
+    float vert = max(sdBox2(vec2(rep(b.x, 6.0), yz.y), vec2(0.16, 0.2)), abs(b.y - 3.6) - 3.4);
+    res = opU(res, min(min(chordB, chordT), min(diag, vert)), M_STRUCT);
+    // 能量槽：桥面边梁外侧
+    float slotB = sdBox2(vec2(b.y + 0.35, abs(b.z) - 5.07), vec2(0.07, 0.03));
+    res = opU(res, slotB, M_CYAN);
+    // 桥面下：横梁、纵梁、下平联
+    float xb6 = rep(b.x, 6.0);
+    float cross = max(sdIBeam2(vec2(xb6, b.y + 1.35), 0.55, 0.22, 0.05, 0.02), abs(b.z) - 4.9);
+    float stringer = sdIBeam2(vec2(abs(b.z) - 2.4, b.y + 1.25), 0.45, 0.18, 0.05, 0.02);
+    vec2 lat = vec2(abs(rep(b.x, 12.0)), abs(b.z));
+    float bracing = length(vec2(sdSeg2(lat, vec2(0.0, 0.0), vec2(6.0, 4.6)), b.y + 2.0)) - aaRadius(0.09, lod);
+    res = opU(res, min(min(cross, stringer), bracing), M_STRUCT);
+    // 导航灯
+    float lampB = sdBox3(vec3(rep(b.x - 12.0, 24.0), b.y + 1.0, abs(b.z) - 5.15), vec3(0.18, 0.12, 0.08));
+    res = opU(res, lampB, M_LAMP);
+    // 轨道（两线）
+    if (b.y < 1.0) {
+        float rails = sdBox2(vec2(abs(abs(b.z) - 2.1) - 0.72, b.y - 0.09), vec2(0.04, 0.09));
+        res = opU(res, rails, M_STEEL);
+        if (lod < 0.04) {
+            float sleeper = sdBox3(vec3(rep(b.x, 0.7), b.y - 0.03, abs(b.z) - 2.1), vec3(0.11, 0.05, 1.15));
+            res = opU(res, sleeper, M_IRON);
+        }
+    }
+    // 两列货车（不同方向、不同速度）
+    res = opU2(res, trainSDF(b, p.x, u_mech.x, 1.0, -2.1, 9.0, lod));
+    res = opU2(res, trainSDF(b, p.x, u_mech.y, -1.0, 2.1, 7.0, lod));
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 升降塔：四角立柱、横撑、交叉斜撑、导轨、钢索、升降舱、配重
+// ---------------------------------------------------------------------------
+vec2 towerSDF(vec3 q, float lod) {
+    vec2 t2 = q.xz - TWR;
+    float bound = max(abs(t2.x), abs(t2.y)) - 3.05;
+    if (bound > 1.2) {
+        return vec2(bound, M_STEEL);
+    }
+    vec3 tp = vec3(t2.x, q.y, t2.y);
+    vec3 ap = vec3(abs(tp.x), tp.y, abs(tp.z));
+    float yb = rep(tp.y, 4.0);
+    vec2 res = vec2(1e5, M_STEEL);
+    float col = sdChamferBox2(vec2(ap.x - 2.7, ap.z - 2.7), vec2(0.27, 0.27), 0.08);
+    float br = min(sdBox3(vec3(ap.x - 2.72, yb, tp.z), vec3(0.09, 0.13, 2.7)),
+                   sdBox3(vec3(tp.x, yb, ap.z - 2.72), vec3(2.7, 0.13, 0.09)));
+    res = opU(res, min(col, br), M_STRUCT);
+    float dr = aaRadius(0.055, lod);
+    float dg1 = length(vec2(sdSeg2(vec2(abs(tp.z), abs(yb)), vec2(0.0), vec2(2.62, 1.92)), ap.x - 2.72)) - dr;
+    float dg2 = length(vec2(sdSeg2(vec2(abs(tp.x), abs(yb)), vec2(0.0), vec2(2.62, 1.92)), ap.z - 2.72)) - dr;
+    res = opU(res, min(dg1, dg2), M_PAINT);
+    float guide = sdBox2(vec2(ap.x - 2.25, tp.z), vec2(0.07, 0.1));
+    res = opU(res, guide, M_STEEL);
+    float cy = tp.y - u_mech.z;
+    float cr = aaRadius(0.045, lod);
+    float cables = length(vec2(abs(tp.x) - 0.75, abs(tp.z) - 0.75)) - cr;
+    res = opU(res, cables, M_CABLE);
+    // 升降舱
+    vec3 cb = vec3(tp.x, cy, tp.z);
+    float cab = sdChamferBox(cb, vec3(1.95, 2.3, 1.95), 0.12);
+    float winC = sdBox3(vec3(cb.x, cy - 0.45, abs(cb.z) - 1.95), vec3(1.45, 0.72, 0.08));
+    cab = max(cab, -winC);
+    res = opU(res, cab, M_HAZARD);
+    float glass = sdBox3(vec3(cb.x, cy - 0.45, abs(cb.z) - 1.9), vec3(1.45, 0.72, 0.02));
+    res = opU(res, glass, M_GLASS);
+    float topF = min(sdBox3(cb - vec3(0.0, 2.55, 0.0), vec3(1.7, 0.22, 0.35)), sdCylX(cb - vec3(0.0, 3.0, 0.0), 0.5, 0.3));
+    res = opU(res, topF, M_IRON);
+    float beacon = length(cb - vec3(1.4, 2.45, 1.4)) - 0.12;
+    res = opU(res, beacon, M_EMBER);
+    // 工作灯：每 12 m 一层，装在朝井腔一侧的两根立柱上
+    float ly = rep(tp.y - 6.0, 12.0);
+    float tl = sdBox3(vec3(ap.x - 2.98, ly, tp.z + 2.98), vec3(0.16, 0.1, 0.16));
+    res = opU(res, tl, M_LAMP);
+    // 配重（北侧，反向运动）
+    float cw = sdBox3(vec3(tp.x, tp.y - u_mech.w, tp.z - 2.25), vec3(1.0, 2.6, 0.22));
+    res = opU(res, cw, M_IRON);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 横跨井腔的桁架层：y = 72 - 75k（排除 -3 那一层）。72 那层是锻炉吊挂环梁
+// ---------------------------------------------------------------------------
+float trussGirder(vec3 g, float hd, float hw, float bay, float lod) {
+    // g.x 沿梁方向，g.y 竖直（居中），g.z 横向
+    float chords = sdChamferBox2(vec2(abs(g.y) - hd, abs(g.z) - hw), vec2(0.38, 0.38), 0.08);
+    float xm = abs(rep(g.x, 2.0 * bay));
+    float dg = length(vec2(sdSeg2(vec2(xm, g.y), vec2(0.0, -hd), vec2(bay, hd)), abs(g.z) - hw)) - aaRadius(0.2, lod);
+    float vt = max(sdBox2(vec2(rep(g.x, bay), abs(g.z) - hw), vec2(0.14, 0.14)), abs(g.y) - hd);
+    float tie = max(sdBox2(vec2(rep(g.x, bay), abs(g.y) - hd), vec2(0.12, 0.12)), abs(g.z) - hw);
+    return min(min(chords, dg), min(vt, tie));
+}
+
+vec2 crossTrussSDF(vec3 q, float r, float lod) {
+    float k = round((q.y - 72.0) / 75.0);
+    float km = mod(k, 4.0);
+    float yl = q.y - 72.0 - 75.0 * k;
+    if (km > 2.5) {
+        return vec2(75.0 - abs(yl) - 4.5, M_IRON);
+    }
+    if (abs(yl) > 6.5) {
+        return vec2(abs(yl) - 4.4, M_IRON);
+    }
+    // 旋转 45°，沿对角线方向
+    vec2 d = vec2(q.x + q.z, q.z - q.x) * 0.70710678;
+    vec2 ad = abs(d);
+    vec2 res = vec2(1e5, M_IRON);
+    if (km < 0.5) {
+        float ring = sdChamferBox2(vec2(r - 21.0, yl), vec2(1.3, 1.8), 0.3);
+        res = opU(res, ring, M_STRUCT);
+        float ga = trussGirder(vec3(ad.x - 41.5, yl, d.y), 3.0, 1.5, 4.0, lod);
+        ga = max(ga, 22.0 - ad.x);
+        float gb = trussGirder(vec3(ad.y - 41.5, yl, d.x), 3.0, 1.5, 4.0, lod);
+        gb = max(gb, 22.0 - ad.y);
+        res = opU(res, min(ga, gb), M_STRUCT);
+    } else {
+        float ga = trussGirder(vec3(d.x, yl, d.y), 3.0, 1.6, 4.0, lod);
+        float gb = trussGirder(vec3(d.y, yl, d.x), 3.0, 1.6, 4.0, lod);
+        float hubT = sdChamferBox2(vec2(r - 0.0, yl), vec2(4.0, 3.4), 0.6);
+        res = opU(res, min(min(ga, gb), hubT), M_STRUCT);
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 场景总 SDF
+// ---------------------------------------------------------------------------
+vec2 mapScene(vec3 p, float lod) {
+    vec3 q = cellLocal(p);
+    float r = length(q.xz);
+    vec2 res = wallSDF(q, r, lod);
+    res = opU2(res, corridorSDF(q, r, lod));
+    res = opU2(res, galleryDetailSDF(q, lod));
+    res = opU2(res, platformSDF(q, lod, 0.0, -1.0, 1.0));
+    res = opU2(res, platformSDF(q, lod, 24.0, 1.0, 0.0));
+    res = opU2(res, furnaceSDF(q, lod));
+    res = opU2(res, pistonSDF(q, lod));
+    res = opU2(res, bridgeSDF(p, q, lod));
+    res = opU2(res, towerSDF(q, lod));
+    res = opU2(res, crossTrussSDF(q, r, lod));
+    return res;
+}
+
+float mapD(vec3 p, float lod) {
+    return mapScene(p, lod).x;
+}

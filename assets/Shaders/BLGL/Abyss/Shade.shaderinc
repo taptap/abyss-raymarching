@@ -1,0 +1,361 @@
+// ============================================================================
+// Abyss · 材质、光照、雾与体积光
+// ============================================================================
+
+float phaseHG(float c, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+
+// 锻炉光源：熔芯圆盘上离 q 最近的点
+vec3 furnLightPos(vec3 q) {
+    vec2 h = q.xz;
+    float l = length(h);
+    vec2 c = (l > 12.5) ? h * (12.5 / l) : h;
+    return vec3(c.x, u_furn.x - 2.5, c.y);
+}
+
+// 体积光里锻炉的遮挡：旋转叶片投下的光柱、炉体侧面与炉底的遮挡
+float furnaceVolOcc(vec3 q) {
+    vec3 fp = q - vec3(0.0, u_furn.x, 0.0);
+    float rho = length(fp.xz);
+    float occ = 1.0;
+    if (fp.y > 0.0) {
+        // 叶片在角度周期里占 [0, 0.42]：到该区间边界的有符号距离，越高越模糊（面光源半影）
+        float soft = clamp(0.03 + fp.y * 0.006, 0.03, 0.22);
+        float s = fract((atan(fp.x, fp.z) - u_furn.y) * (16.0 / TAU));
+        float de = (s < 0.5) ? min(s, 0.5 - s) : (-min(s - 0.5, 1.0 - s));
+        float blade = smoothstep(-soft, soft, de);
+        float inMouth = 1.0 - smoothstep(12.0, 17.0 + fp.y * 0.35, rho);
+        occ = mix(0.35, 1.0 - 0.88 * blade, inMouth);
+    }
+    float side = (1.0 - smoothstep(5.5, 8.0, abs(fp.y + 0.5))) * smoothstep(13.5, 16.0, rho);
+    occ *= 1.0 - 0.96 * side;
+    occ *= mix(1.0, 0.07, smoothstep(-3.0, -7.0, fp.y));
+    return occ;
+}
+
+// ---------------------------------------------------------------------------
+// GGX（含各向异性）
+// ---------------------------------------------------------------------------
+float dGGX(float NoH, float a) {
+    float a2 = a * a;
+    float d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+float dGGXAniso(float NoH, float ToH, float BoH, float at, float ab) {
+    float d = (ToH * ToH) / (at * at) + (BoH * BoH) / (ab * ab) + NoH * NoH;
+    return 1.0 / (PI * at * ab * d * d);
+}
+
+vec3 evalLight(vec3 n, vec3 v, vec3 l, vec3 diffCol, vec3 F0, float a, vec3 T, float aniso) {
+    float NoL = dot(n, l);
+    if (NoL <= 0.0) {
+        return vec3(0.0);
+    }
+    vec3 h = normalize(v + l);
+    float NoV = max(dot(n, v), 1e-3);
+    float NoH = max(dot(n, h), 0.0);
+    float VoH = max(dot(v, h), 0.0);
+    float D = 0.0;
+    if (aniso > 0.02) {
+        vec3 B = normalize(cross(n, T));
+        vec3 Tn = cross(B, n);
+        float at = max(a * (1.0 + aniso * 0.9), 0.003);
+        float ab = max(a * (1.0 - aniso * 0.9), 0.003);
+        D = dGGXAniso(NoH, dot(Tn, h), dot(B, h), at, ab);
+    } else {
+        D = dGGX(NoH, max(a, 0.003));
+    }
+    float k = a * 0.5;
+    float Vis = 0.25 / ((NoV * (1.0 - k) + k) * (NoL * (1.0 - k) + k));
+    vec3 F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+    return (diffCol * (1.0 / PI) * (1.0 - F) + D * Vis * F) * NoL;
+}
+
+// 环境反射近似：深处橙光、上方冷蓝、锻炉方向的光斑
+vec3 envRadiance(vec3 q, vec3 R, float rough) {
+    vec3 c = mix(u_fog_far * 6.0 + vec3(0.006), u_fog_near * 4.5, smoothstep(0.5, -0.9, R.y));
+    vec3 fc = vec3(0.0, u_furn.x - 2.5, 0.0);
+    vec3 toF = fc - q;
+    float dF = length(toF);
+    toF /= dF;
+    float lobe = pow(max(dot(R, toF), 0.0), mix(90.0, 3.0, rough));
+    c += u_col_furn * (u_emit.x * 0.9 * lobe / (1.0 + dF * dF * 0.0015));
+    // 环廊青色光带的掠射反光
+    float band = pow(max(1.0 - abs(R.y), 0.0), 6.0);
+    c += u_col_slot * (u_emit.y * 0.04 * band);
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// 程序化材质
+// ---------------------------------------------------------------------------
+void surfaceMaterial(float id, vec3 p, vec3 q, vec3 n, float lod, float curv, float ao,
+                     out vec3 albedo, out float rough, out float metal, out vec3 emis,
+                     out vec3 tanT, out float aniso, out float cover) {
+    emis = vec3(0.0);
+    aniso = 0.0;
+    cover = 1.0;
+    tanT = (abs(n.y) < 0.8) ? normalize(vec3(0.0, 1.0, 0.0) - n * n.y) : normalize(vec3(1.0, 0.0, 0.0) - n * n.x);
+    vec3 an = abs(n);
+    vec3 tw = an * an * an * an;
+    tw /= (tw.x + tw.y + tw.z);
+    // 大块污渍与细节噪声（三平面投影，按像素覆盖钳制频率）
+    float big = tw.x * fbm2s(q.yz * 0.12, lod * 0.12) + tw.y * fbm2s(q.zx * 0.12, lod * 0.12) + tw.z * fbm2s(q.xy * 0.12, lod * 0.12);
+    float fine = tw.x * vnoise2(q.yz * 4.0) + tw.y * vnoise2(q.zx * 4.0) + tw.z * vnoise2(q.xy * 4.0);
+    fine = mix(0.5, fine, lodFade(0.25, lod));
+    float wear = smoothstep(0.04, 0.22, curv) * smoothstep(0.25, 0.65, fine + 0.25 * big) * lodFade(0.05, lod);
+    float dirt = clamp((1.0 - ao) * 1.3, 0.0, 1.0);
+    // 油渍：低频斑块 + 竖直滴流
+    float drip = vnoise2(vec2(dot(q.xz, vec2(0.7, 0.7)) * 3.0 + q.x * 0.0, q.y * 0.35));
+    float oil = smoothstep(0.64, 0.8, big + 0.2 * drip) * (0.3 + 0.7 * dirt);
+
+    if (id == M_IRON || id == M_DEEP) {
+        // 粗糙铸铁：氧化暗色、坑点、缝里的锈、磨亮的边
+        float pit = mix(0.5, vnoise2((q.xy + q.zy) * 9.0), lodFade(0.1, lod));
+        albedo = vec3(0.1, 0.095, 0.09) * (0.75 + 0.5 * big) * (0.9 + 0.2 * pit);
+        rough = 0.82 + 0.12 * pit;
+        metal = 0.3;
+        float dripI = vnoise2(vec2(atan(q.x, q.z) * 90.0, q.y * 0.5));
+        float rust = smoothstep(0.62, 0.9, dirt * 0.75 + big * 0.25 + 0.25 * dripI) * lodFade(0.3, lod);
+        albedo = mix(albedo, vec3(0.11, 0.05, 0.025), rust * 0.6);
+        albedo = mix(albedo, vec3(0.34, 0.33, 0.32), wear);
+        metal = mix(metal, 0.95, wear);
+        rough = mix(rough, 0.42, wear);
+        if (id == M_DEEP) {
+            albedo *= 0.55;
+            vec3 cid = floor(q * vec3(0.45, 0.6, 0.45));
+            float hsh = hash13(cid);
+            if (hsh > 0.986) {
+                vec3 lc = (hash13(cid + 7.0) > 0.5) ? u_col_slot : u_col_lamp;
+                vec3 fq = fract(q * vec3(0.45, 0.6, 0.45)) - 0.5;
+                float spot = 1.0 - smoothstep(0.03, 0.09, length(fq.xy + fq.zy * 0.5));
+                emis += lc * spot * 6.0;
+            }
+        }
+    } else if (id == M_STEEL || id == M_FURN) {
+        // 拉丝钢板：沿切线方向的细拉丝 + 螺栓孔位般的板缝
+        vec3 B = normalize(cross(n, tanT));
+        float bc = dot(q, B);
+        float brush = mix(0.5, vnoise2(vec2(bc * 70.0, dot(q, tanT) * 1.5)), lodFade(0.012, lod));
+        float brush2 = mix(0.5, vnoise2(vec2(bc * 13.0, dot(q, tanT) * 0.4)), lodFade(0.06, lod));
+        albedo = vec3(0.36, 0.36, 0.37) * (0.82 + 0.2 * brush + 0.15 * brush2);
+        albedo *= 0.75 + 0.3 * big;
+        rough = 0.3 + 0.16 * brush2 + 0.1 * big;
+        metal = 1.0;
+        aniso = 0.65;
+        // 板缝
+        vec2 pc = vec2(dot(q, tanT), bc);
+        vec2 seam = abs(fract(pc / vec2(2.4, 1.8)) - 0.5) * vec2(2.4, 1.8);
+        float sm = (1.0 - smoothstep(0.0, 0.012 + lod, min(seam.x, seam.y))) * lodFade(0.04, lod);
+        albedo *= 1.0 - 0.45 * sm;
+        albedo = mix(albedo, vec3(0.05, 0.045, 0.04), dirt * 0.45 + oil * 0.25);
+        albedo = mix(albedo, vec3(0.6, 0.6, 0.6), wear * 0.6);
+        rough = mix(rough, 0.18, wear);
+        if (id == M_FURN) {
+            // 炉体：回火色、内侧热辉光与裂纹
+            vec3 fp = furnaceFrame(q);
+            vec2 cs = vec2(length(fp.xz) - FR, fp.y);
+            float inner = smoothstep(0.1, -0.95, cs.x / max(length(cs), 1e-3));
+            albedo = mix(albedo * 0.45, vec3(0.09, 0.06, 0.1), 0.35 + 0.4 * inner);
+            rough = mix(rough, 0.5, 0.5);
+            float crack = 1.0 - abs(2.0 * vnoise2(vec2(atan(fp.x, fp.z) * 60.0, fp.y * 3.0)) - 1.0);
+            crack = smoothstep(0.93, 0.99, crack) * lodFade(0.05, lod);
+            emis += u_col_furn * (u_emit.x * 0.12) * (inner * inner * (0.35 + 1.6 * crack) + 0.03 * inner);
+        }
+    } else if (id == M_STRUCT) {
+        // 涂装结构钢：深蓝灰 / 橄榄色漆，边缘磨出金属，接缝向下拖出锈迹
+        vec3 paint = mix(vec3(0.075, 0.085, 0.095), vec3(0.1, 0.095, 0.08), big);
+        albedo = paint * (0.9 + 0.2 * fine);
+        rough = 0.55 + 0.2 * fine;
+        metal = 0.0;
+        float streak = vnoise2(vec2(dot(q.xz, vec2(0.8, 0.6)) * 7.0, q.y * 0.6));
+        float rust = smoothstep(0.72, 0.95, streak * 0.5 + big * 0.15 + dirt * 0.6) * lodFade(0.15, lod);
+        albedo = mix(albedo, vec3(0.12, 0.055, 0.028), rust * 0.5);
+        rough = mix(rough, 0.85, rust);
+        albedo = mix(albedo, vec3(0.42, 0.41, 0.4), wear);
+        metal = mix(metal, 1.0, wear);
+        rough = mix(rough, 0.32, wear);
+        albedo = mix(albedo, vec3(0.03), oil * 0.5);
+        rough = mix(rough, 0.15, oil * 0.6);
+    } else if (id == M_CHROME) {
+        // 抛光活塞杆：环向车削纹 + 油膜
+        vec3 ax = vec3(0.0, 1.0, 0.0);
+        tanT = normalize(cross(ax, n) + vec3(1e-4));
+        float lathe = mix(0.5, vnoise2(vec2(q.y * 180.0, 0.0)), lodFade(0.004, lod));
+        albedo = vec3(0.86, 0.86, 0.88);
+        rough = 0.06 + 0.06 * lathe + 0.08 * oil;
+        metal = 1.0;
+        aniso = 0.55;
+        albedo = mix(albedo, vec3(0.35, 0.3, 0.22), oil * 0.5);
+    } else if (id == M_PAINT || id == M_RAIL || id == M_HAZARD) {
+        vec3 paint = vec3(0.62, 0.42, 0.05);
+        if (id == M_HAZARD) {
+            float st = fract((q.x + q.y + q.z) * 1.4);
+            float sw = smoothstep(0.48, 0.52, st) - smoothstep(0.98, 1.0, st);
+            sw = mix(0.5, sw, lodFade(0.35, lod));
+            paint = mix(paint, vec3(0.025, 0.025, 0.025), sw);
+        }
+        albedo = paint * (0.6 + 0.6 * big);
+        albedo = mix(albedo, vec3(0.06, 0.05, 0.04), dirt * 0.5 + oil * 0.4);
+        rough = 0.55 + 0.2 * fine;
+        metal = 0.0;
+        albedo = mix(albedo, vec3(0.38, 0.37, 0.36), wear);
+        metal = mix(metal, 1.0, wear);
+        rough = mix(rough, 0.35, wear);
+        if (id == M_RAIL) {
+            cover = clamp(0.026 / (0.55 * lod), 0.0, 1.0);
+        }
+    } else if (id == M_CABLE) {
+        albedo = vec3(0.16, 0.16, 0.17);
+        rough = 0.4;
+        metal = 0.9;
+        tanT = vec3(0.0, 1.0, 0.0);
+        aniso = 0.5;
+        cover = clamp(0.04 / (0.55 * lod), 0.0, 1.0);
+    } else if (id == M_EMBER) {
+        float flow = fbm2(vec2(atan(q.x, q.z) * 9.0 + u_frame.x * 0.15, q.y * 0.6 + length(q.xz) * 0.3 - u_frame.x * 0.4), lod * 3.0);
+        albedo = vec3(0.02);
+        rough = 0.6;
+        metal = 0.0;
+        emis = u_col_furn * u_emit.x * (0.45 + 1.1 * flow * flow) * u_furn.w;
+    } else if (id == M_CYAN) {
+        float ang = atan(q.x, q.z);
+        float lvIdx = mod(round(q.y / LVL), 25.0);
+        float seg = fract(ang * (30.0 / TAU) + hash11(lvIdx) * 3.0);
+        float lit = smoothstep(0.02, 0.05, seg) * (1.0 - smoothstep(0.55, 0.58, seg));
+        lit = mix(0.56, lit, lodFade(0.6, lod));
+        float lvl = (hash11(lvIdx + 3.1) > 0.55) ? 1.0 : 0.05;
+        float flick = 0.85 + 0.15 * sin(u_frame.x * 23.0 + lvIdx * 7.0) * step(0.93, hash11(lvIdx + 9.0));
+        albedo = vec3(0.02);
+        rough = 0.3;
+        metal = 0.0;
+        emis = u_col_slot * u_emit.y * lit * lvl * flick;
+    } else if (id == M_PORTAL) {
+        albedo = vec3(0.05);
+        rough = 0.3;
+        metal = 0.0;
+        emis = u_col_lamp * (u_emit.z * 0.06);
+    } else if (id == M_LAMP) {
+        albedo = vec3(0.05);
+        rough = 0.3;
+        metal = 0.0;
+        emis = u_col_lamp * u_emit.z;
+    } else if (id == M_FLOOR) {
+        // 花纹钢板 + 走道磨痕 + 平台边缘警示斜纹
+        vec2 g = q.xz * 5.0;
+        vec2 cc = fract(g) - 0.5;
+        float flip = mod(floor(g.x) + floor(g.y), 2.0);
+        vec2 rc = rot2(cc, (flip > 0.5) ? 0.785 : (-0.785));
+        float lug = 1.0 - smoothstep(0.08, 0.16, length(rc * vec2(1.0, 3.2)));
+        lug *= lodFade(0.08, lod);
+        albedo = vec3(0.16, 0.16, 0.165) * (0.6 + 0.6 * big) * (1.0 + 0.35 * lug);
+        rough = 0.6 - 0.25 * lug;
+        metal = 0.35;
+        float path = 1.0 - smoothstep(1.5, 4.5, abs(q.x - GX));
+        rough = mix(rough, 0.35, path * 0.5);
+        albedo = mix(albedo, vec3(0.05, 0.045, 0.04), dirt * 0.7 + oil * 0.6);
+        rough = mix(rough, 0.15, oil * 0.8);
+        // 油污积水：几乎镜面，倒映炉火与能量槽
+        float puddle = smoothstep(0.6, 0.66, fbm2(q.xz * 0.32 + 3.7, lod * 0.32)) * step(0.5, n.y);
+        albedo = mix(albedo, vec3(0.015, 0.014, 0.013), puddle);
+        rough = mix(rough, 0.035, puddle);
+        metal = mix(metal, 0.0, puddle);
+        if (n.y > 0.5) {
+            float edge = min(abs(abs(q.z) - 38.3), 99.0);
+            if (edge < 0.55) {
+                float st = fract((q.x + q.z) * 1.6);
+                float yel = smoothstep(0.45, 0.5, st) * mix(1.0, 0.0, smoothstep(0.95, 1.0, st));
+                yel = mix(0.5, yel, lodFade(0.3, lod));
+                albedo = mix(albedo, vec3(0.6, 0.42, 0.04), yel * (1.0 - 0.6 * big));
+                metal = mix(metal, 0.0, yel);
+            }
+        }
+    } else if (id == M_CLOTH) {
+        float fy = q.y - ((q.y > 12.0) ? 24.0 : 0.0);
+        albedo = vec3(0.03, 0.033, 0.038);
+        rough = 0.9;
+        metal = 0.0;
+        float stripe = (1.0 - smoothstep(0.02, 0.03, abs(fy - 1.22))) + (1.0 - smoothstep(0.015, 0.025, abs(fy - 1.43)));
+        stripe = clamp(stripe, 0.0, 1.0) * lodFade(0.05, lod);
+        albedo = mix(albedo, vec3(0.55, 0.55, 0.5), stripe);
+        emis += vec3(0.04, 0.04, 0.035) * stripe;
+    } else if (id == M_HELMET) {
+        albedo = vec3(0.7, 0.55, 0.1);
+        rough = 0.35;
+        metal = 0.0;
+    } else if (id == M_CARGO) {
+        vec3 base = (q.z - BZ < 0.0) ? vec3(0.22, 0.06, 0.035) : vec3(0.05, 0.12, 0.13);
+        albedo = base * (0.6 + 0.7 * big);
+        float streak = vnoise2(vec2(dot(q.xz, vec2(1.0, 0.3)) * 4.0, q.y * 0.4));
+        albedo = mix(albedo, vec3(0.12, 0.05, 0.02), smoothstep(0.55, 0.85, streak) * 0.6 * lodFade(0.2, lod));
+        rough = 0.6;
+        metal = 0.2;
+        albedo = mix(albedo, vec3(0.3, 0.3, 0.3), wear);
+        metal = mix(metal, 1.0, wear);
+    } else if (id == M_INGOT) {
+        float hot = fbm2(q.xz * 1.5 + q.y, lod * 1.5);
+        albedo = vec3(0.03);
+        rough = 0.7;
+        metal = 0.0;
+        emis = u_col_furn * (u_emit.x * 0.3) * (0.35 + hot * hot * 1.6);
+    } else if (id == M_GLASS) {
+        albedo = vec3(0.02);
+        rough = 0.08;
+        metal = 0.0;
+        emis = u_col_lamp * (u_emit.z * 0.22);
+    } else {
+        // M_SCREEN
+        float scan = 0.75 + 0.25 * sin(q.y * 400.0) * lodFade(0.004, lod);
+        albedo = vec3(0.01);
+        rough = 0.2;
+        metal = 0.0;
+        emis = u_col_slot * (u_emit.y * 0.35) * scan;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 阴影、AO
+// ---------------------------------------------------------------------------
+float softShadow(vec3 ro, vec3 rd, float tmax, float pixAng) {
+    float res = 1.0;
+    float t = 0.12;
+    for (int i = 0; i < 48; i++) {
+        if (float(i) >= u_quality.y) {
+            break;
+        }
+        float h = mapD(ro + rd * t, pixAng * t + 0.01);
+        res = min(res, 9.0 * h / t);
+        t += clamp(h, 0.2, 7.0);
+        if (res < 0.01 || t > tmax) {
+            break;
+        }
+    }
+    res = clamp(res, 0.0, 1.0);
+    return res * res * (3.0 - 2.0 * res);
+}
+
+float calcAO(vec3 p, vec3 n, float lod) {
+    float occ = 0.0;
+    float sca = 1.0;
+    int nSmall = (lod > 0.12) ? 0 : 5;
+    for (int i = 0; i < 5; i++) {
+        if (i >= nSmall) {
+            break;
+        }
+        float h = 0.03 + 0.55 * float(i) / 4.0;
+        float d = mapD(p + n * h, lod);
+        occ += (h - d) * sca;
+        sca *= 0.8;
+    }
+    float ao = clamp(1.0 - 1.7 * occ, 0.0, 1.0);
+    // 大尺度遮蔽：平台底部、环廊下方、孔洞深处
+    float h1 = 2.2;
+    float h2 = 6.5;
+    float d1 = mapD(p + n * h1, lod + 0.05);
+    float d2 = mapD(p + n * h2, lod + 0.1);
+    float big = clamp(0.35 + 0.65 * (d1 / h1), 0.0, 1.0) * clamp(0.45 + 0.55 * (d2 / h2), 0.0, 1.0);
+    return ao * big;
+}

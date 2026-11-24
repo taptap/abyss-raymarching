@@ -1,0 +1,9 @@
+# 本地临时文件与渲染输出
+.tmp/
+*.log
+.DS_Store
+
+# 录制 / 调试工具运行时生成的临时入口
+scripts/dev_one_*.lua
+scripts/dev_sheet.lua
+scripts/rec_*.lua
